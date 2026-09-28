@@ -79,21 +79,32 @@ export async function runCrawl(opts: CrawlOptions): Promise<CrawlResult> {
   let hits = 0, reportedTotal = 0;
   const requests = { n: 0 };
 
-  let session = await openSession(o, used);
+  // The first session must work (nothing read yet). A later one that fails ends the run
+  // early instead of throwing: the days already read are returned (and synced by the app),
+  // the rest are listed as failed windows. Seen on Windows 2026-09-28: 25 days / ~29,000
+  // events read, then the IP was rate-limited and the whole run was thrown away.
+  let session: Session | null = await openSession(o, used);
   try {
     for (let i = 0; i < days.length; i++) {
       const day: Window = days[i];
       let parts;
       try {
-        parts = await crawlWindow(session.page, day, o.concurrency, requests, o.log);
+        parts = await crawlWindow(session!.page, day, o.concurrency, requests, o.log);
       } catch (err) {
         // Blocked by AXS, or the page/browser died: window closed or crashed (seen on
         // a 365-day run, 2026-09-26) or the page reloaded mid-batch. -> new session, same day.
         const pageDied = /has been closed|Target closed|browser has disconnected|context was destroyed/i.test(String(err));
         if (!(err instanceof BlockedError) && !pageDied) throw err;
         o.log(`  !! ${windowLabel(day)}: ${err instanceof Error ? err.message.split("\n")[0] : err} - new session`);
-        await session.browser.close().catch(() => {});
-        session = await openSession(o, used);
+        await session!.browser.close().catch(() => {});
+        session = null;
+        try {
+          session = await openSession(o, used);
+        } catch (openErr) {
+          o.log(`  !! stopping early, keeping the ${i} day(s) already read: ${openErr instanceof Error ? openErr.message : openErr}`);
+          for (let k = i; k < days.length; k++) failed.push(`${windowLabel(days[k])} (not read: no working session left)`);
+          break;
+        }
         i--; // redo the same day
         continue;
       }
@@ -110,7 +121,7 @@ export async function runCrawl(opts: CrawlOptions): Promise<CrawlResult> {
       o.log(`${day.start.toISOString().slice(0, 10)}: ${dayHits}/${dayTotal} hits, ${byId.size} unique so far`);
     }
   } finally {
-    await session.browser.close().catch(() => {});
+    if (session) await session.browser.close().catch(() => {});
   }
 
   const now = new Date().toISOString().slice(0, 19) + "Z";
